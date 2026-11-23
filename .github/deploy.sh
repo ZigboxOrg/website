@@ -12,7 +12,8 @@
 # Environment: SITE (default https://zigbox.org), GITHUB_OUTPUT (default /dev/null), GH_TOKEN;
 # gate: EVENT, SELF_SHA, HAVE_CF (true when the Cloudflare secrets are set), ALLOW_OLDER (true
 # only from a workflow_dispatch input); packages: TAG, ASSET_ID, SUM.
-# GATE_BOX, GATE_CUBE and GATE_RELEASES (a file) replace the API reads, for tests only.
+# GATE_BOX, GATE_CUBE and GATE_RELEASES (a file) replace the API reads, for tests only
+# (.github/deploy-gate-test.sh).
 set -euo pipefail
 
 site=${SITE:-https://zigbox.org}
@@ -53,24 +54,48 @@ skip() {
 }
 
 # Sets `live` to the tag the live stamp names: a tag, "none", or "" when zigbox.org has no stamp
-# (404). Skips the run when the stamp cannot be read, as then it cannot tell whether it would
-# step backwards. Not run in a subshell.
+# (404), and `live_created` to the created_at the stamp records for that tag ("" when none). A
+# stamp that cannot be read (any other status, or no packages tag) skips a scheduled run, as then
+# it cannot tell whether it would step backwards; a push or dispatch warns and goes on as if
+# zigbox.org had no stamp (pick-release.jq then deploys only the newest published release), so
+# a redeploy can bring zigbox.org back. Not run in a subshell.
 live_tag() {
-  local code tag
+  local code tag why=""
   live=""
+  live_created=""
   code=$(get "deploy-stamp.txt?run=${GITHUB_RUN_ID:-0}" live-stamp.txt)
   case $code in
     404) : > live-stamp.txt; return ;;
     200) ;;
-    *) [ "${ALLOW_OLDER:-}" = true ] && { : > live-stamp.txt; return; }
-       skip "not deployed: $site/deploy-stamp.txt answered $code, so this run cannot tell which packages it would replace" warn ;;
+    *) why="answered $code" ;;
   esac
-  tag=$(sed -n 's/^packages \([^ ]*\).*$/\1/p' live-stamp.txt | head -n 1)
-  if [ "$tag" != none ] && ! [[ "$tag" =~ ^v[0-9A-Za-z.+-]+$ ]]; then
-    [ "${ALLOW_OLDER:-}" = true ] && { : > live-stamp.txt; return; }
-    skip "not deployed: $site/deploy-stamp.txt names no packages tag, so this run cannot tell which packages it would replace" warn
+  if [ -z "$why" ]; then
+    tag=$(sed -n 's/^packages \([^ ]*\).*$/\1/p' live-stamp.txt | head -n 1)
+    if [ "$tag" != none ] && ! [[ "$tag" =~ ^v[0-9A-Za-z.+-]+$ ]]; then why="names no packages tag"; fi
+  fi
+  if [ -n "$why" ]; then
+    if [ "$EVENT" = schedule ]; then
+      skip "not deployed: $site/deploy-stamp.txt $why, so this run cannot tell which packages it would replace" warn
+    fi
+    echo "::warning::$site/deploy-stamp.txt $why; a $EVENT run deploys as if zigbox.org had no stamp (the newest published release's packages, never an older one)"
+    : > live-stamp.txt
+    return
   fi
   live=$tag
+  live_created=$(sed -n 's/^packages [^ ]* \([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9:]\{8\}Z\) .*$/\1/p' \
+    live-stamp.txt | head -n 1)
+}
+
+# Ends the run on a `wait` for TAG ($1): with a warning on a push or dispatch (which then does
+# not deploy the rest of the site either), and on a schedule once TAG's release has not changed
+# for 2 hours (its updated_at moves with every asset upload or deletion), as then the asset is
+# not being replaced but is missing for good: someone must upload it again.
+wait_for() {
+  local upd age kind=""
+  upd=$(jq -r --arg t "$1" '[.[][] | select(.tag_name == $t)][0].updated_at // ""' releases.json)
+  age=$(( $(date +%s) - $(date -d "${upd:-1970-01-01T00:00:00Z}" +%s) ))
+  if [ "$EVENT" != schedule ] || [ "$age" -gt 7200 ]; then kind=warn; fi
+  skip "not deployed: $asset of $1 is not uploaded right now (a refresh replacing it, or an upload in progress; release last changed $upd), and nothing else may replace what zigbox.org serves, so the whole site waits; the next run takes it. If it stays missing, upload it again (Zigbox's docs/releases/packaging.md)" "$kind"
 }
 
 # Whether zigbox.org serves the live stamp's signed files: compares each against its `file` line.
@@ -97,7 +122,7 @@ gate() {
   if [ "$EVENT" = schedule ] && [ "${HAVE_CF:-}" != true ]; then
     skip "not deployed: the CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets are not set" warn
   fi
-  local box cube pick tag="" id="" sum="" deploy=true why
+  local box cube pick tag="" id="" created="" sum="" deploy=true why
   box=${GATE_BOX:-$(gh api repos/ZigboxOrg/zigbox/commits/main --jq .sha)}
   cube=${GATE_CUBE:-$(gh api repos/ZigboxOrg/zigcube/commits/main --jq .sha)}
   if [ -n "${GATE_RELEASES:-}" ]; then
@@ -106,16 +131,21 @@ gate() {
     gh api --paginate --slurp 'repos/ZigboxOrg/zigbox/releases?per_page=100' > releases.json
   fi
   live_tag
-  pick=$(jq -r --arg asset "$asset" --arg live "$live" -f "$here/pick-release.jq" releases.json)
+  pick=$(jq -r --arg asset "$asset" --arg live "$live" --arg live_created "$live_created" \
+    -f "$here/pick-release.jq" releases.json)
   if [[ "$pick" == gone* ]] && [ "${ALLOW_OLDER:-}" = true ]; then
     echo "packages: $live is no longer a published release; allow_older_packages takes the newest"
-    pick=$(jq -r --arg asset "$asset" --arg live "" -f "$here/pick-release.jq" releases.json)
+    pick=$(jq -r --arg asset "$asset" --arg live "" --arg live_created "" \
+      -f "$here/pick-release.jq" releases.json)
+    if [ "$pick" = none ]; then
+      skip "not deployed: no published release exists, and allow_older_packages never deploys without packages" warn
+    fi
   fi
   case $pick in
-    "take "*) read -r _ tag id sum <<< "$pick" ;;
+    "take "*) read -r _ tag id created sum <<< "$pick" ;;
     none) ;;
-    "wait "*) skip "not deployed: zigbox.org serves $live, whose $asset is not uploaded right now (a refresh replacing it, or an upload in progress), and only a newer release may replace it; the next run takes it" ;;
-    "gone "*) skip "not deployed: zigbox.org serves $live, which is no longer a published release, and no newer release carries $asset; only the owner may step back (workflow_dispatch with allow_older_packages)" warn ;;
+    "wait "*) wait_for "${pick#wait }" ;;
+    "gone "*) skip "not deployed: zigbox.org serves $live, which is no longer a published release, and no published release was created after it; only the owner may step back (workflow_dispatch with allow_older_packages)" warn ;;
     *) echo "packages: pick-release.jq printed '$pick'"; exit 1 ;;
   esac
   sum=${sum#sha256:}
@@ -128,7 +158,7 @@ gate() {
     echo "site $SELF_SHA"
     echo "zigbox $box"
     echo "zigcube $cube"
-    if [ -n "$tag" ]; then echo "packages $tag sha256:$sum"; else echo "packages none"; fi
+    if [ -n "$tag" ]; then echo "packages $tag $created sha256:$sum"; else echo "packages none"; fi
   } > stamp-core.txt
   cat stamp-core.txt
   printf '%s\n' "box=$box" "cube=$cube" "tag=$tag" "asset_id=$id" "sum=$sum" >> "$out"

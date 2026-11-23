@@ -34,8 +34,9 @@ on:
     inputs:
       allow_older_packages:
         description: >-
-          Deploy the newest release with packages even when it is older than the tag zigbox.org
-          serves (only when that tag's release was deleted or unpublished)
+          When the tag zigbox.org serves is no longer a published release: deploy the newest
+          published release's packages even when it is older (it waits while that asset is not
+          uploaded, and never deploys without packages)
         type: boolean
         default: false
   repository_dispatch:
@@ -76,6 +77,7 @@ jobs:
           ALLOW_OLDER: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_older_packages }}
         run: |
           self/.github/pick-release-test.sh
+          self/.github/deploy-gate-test.sh
           self/.github/deploy.sh gate
       - name: Fetch and check the signed package repositories
         id: pkg

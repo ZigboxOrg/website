@@ -36,32 +36,47 @@ The decisions are `docs/decisions/2026-11-04-errors-on-org-site.md` in Zigbox an
   or added encoding). `.github/deploy.sh verify DIR` checks an unpacked asset by hand.
 - **Never step backwards.** No run moves zigbox.org's packages to an older release, or to none,
   than the tag the live `/deploy-stamp.txt` names. Only that tag's own asset (refreshed) or a
-  release created after it may replace it. While that tag's asset is not in state `uploaded` (the
+  release created after it may replace it; when that tag's release was deleted, "after" is
+  judged by the `created_at` the stamp records for it, and a stamp that records none (the older
+  format) cannot be ordered. While the asset that may replace it is not in state `uploaded` (the
   weekly refresh's `gh release upload --clobber` deletes it before uploading the new one, and an
-  upload in progress is not `uploaded` either), a run deploys nothing and says so in one line,
-  successfully; the next run takes the new asset. A stamp that cannot be read (any status but
-  200 or 404) is treated the same way. If the live tag's release is deleted or made a draft or
-  prerelease with no newer release carrying the asset, runs deploy nothing and warn; the owner
-  steps back with `gh workflow run deploy.yml -R ZigboxOrg/website -f allow_older_packages=true`.
-  The rule is `.github/pick-release.jq`, table-tested by `.github/pick-release-test.sh` in every
-  run. Any other asset state counts as not there, on both sides of the tag.
+  upload in progress is not `uploaded` either), a run deploys nothing, the rest of the site
+  included, and says so in one line, successfully; the next run takes the new asset. A push or
+  dispatch that waits warns, and so does a scheduled run once that release has not changed for
+  2 hours (its `updated_at` moves with each asset upload): the asset is then missing for good,
+  zigbox.org stays frozen (the Zigbox and Zigcube sites too) until someone uploads it again.
+  With no stamp (404), the newest published release is deployed only once its asset is
+  uploaded, never an older one and never none while a published release exists. A stamp that
+  cannot be read (any status but 200 or 404, or no packages tag) skips a scheduled run with a
+  warning; a push or dispatch on `main` warns and deploys as if there were no stamp, so a
+  redeploy can bring zigbox.org back (say, after the Worker or its route was removed). If the
+  live tag's release is deleted or made a draft or prerelease and no published release was
+  created after it, runs deploy nothing and warn; the owner steps back with
+  `gh workflow run deploy.yml -R ZigboxOrg/website -f allow_older_packages=true`, which deploys
+  the newest published release once its asset is uploaded, and never deploys without packages.
+  The rule is `.github/pick-release.jq`, table-tested by `.github/pick-release-test.sh`, and
+  `deploy.sh gate` is tested end to end by `.github/deploy-gate-test.sh` (a local HTTP server
+  for zigbox.org); both run in every run. Any other asset state counts as not there, on both
+  sides of the tag.
 - Never add a path under `/zigbox/` or `/zigcube/`: those belong to the project sites, which
   are edited in their own repositories.
 - A URL ending in `.html` redirects (307) to the same URL without it (the assets'
   `auto-trailing-slash` handling); links may use either.
 - Pages here are plain HTML and CSS, light and dark, readable at phone width.
-- The newest release is the one with the latest `created_at` among the releases of
-  `ZigboxOrg/zigbox` that are not drafts, not prereleases and carry `zigbox-repos.tar.gz` in state
-  `uploaded`, subject to the rule above. The workflow sorts by `created_at` itself rather than
-  trusting the API's order, as does `gh release list`. Zigbox's release wait
-  (`.github/actions/site-serves/wait.sh`) sorts the same way but counts the asset in any state.
+- A published release is a release of `ZigboxOrg/zigbox` that is not a draft and not a
+  prerelease; the newest is the one with the latest `created_at`, and its packages are served
+  once its `zigbox-repos.tar.gz` is in state `uploaded`, subject to the rule above. The
+  workflow sorts by `created_at` itself rather than trusting the API's order, as does
+  `gh release list`. Zigbox's release wait (`.github/actions/site-serves/wait.sh`) sorts the
+  same way but counts the asset in any state.
 - `/deploy-stamp.txt` names what a deploy was built from, one line each: `site <commit>`,
-  `zigbox <commit>`, `zigcube <commit>` (the `main` commits), `packages <tag> sha256:<hex>`
-  (the asset's sha256, from the API's `digest`) or `packages none`, and with packages one
-  `file <sha256> <path>` line for each of the nine signed files apt and dnf fetch (apt
-  `Release`, `InRelease`, `Release.gpg`, both `repomd.xml` and their `.asc`, both keyrings). The
-  deploy builds from exactly those commits and that asset, and its post-deploy check fetches the
-  stamp as well.
+  `zigbox <commit>`, `zigcube <commit>` (the `main` commits),
+  `packages <tag> <created_at> sha256:<hex>` (the release's `created_at`, and the asset's sha256
+  from the API's `digest`) or `packages none`, and with packages one `file <sha256> <path>`
+  line for each of the nine signed files apt and dnf fetch (apt `Release`, `InRelease`,
+  `Release.gpg`, both `repomd.xml` and their `.asc`, both keyrings). The deploy builds
+  from exactly those commits and that asset, and its post-deploy check fetches the stamp as
+  well.
 - Only `main` deploys. A push to `main`, a `workflow_dispatch` on `main` and a
   `repository_dispatch` of type `site` deploy (unless the rule above holds them back); a pull
   request or a dispatch on another branch only assembles the site and dry-runs the Worker config.
