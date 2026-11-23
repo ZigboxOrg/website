@@ -26,25 +26,60 @@ The decisions are `docs/decisions/2026-11-04-errors-on-org-site.md` in Zigbox an
   by `.github/workflows/deploy.yml`. Fix the generator there.
 - Never add, build or sign anything under `/apt/` or `/rpm/`: those bytes are the owner's signed
   release asset (Zigbox's `docs/releases/packaging.md`). The deploy refuses an asset holding
-  anything but files under `apt/` and `rpm/` and the two keyring files, and after deploying it
-  fetches every file from zigbox.org and fails unless each is served with status 200 and the
-  asset's exact bytes (no redirect, rewrite or added encoding).
+  anything but files under `apt/` and `rpm/` and the two keyring files, or one not signed by the
+  owner: both keyrings must hold exactly the owner's primary key, pinned as `owner_key` in
+  `.github/deploy.sh` (`1207CB8600CE25FFDD3CC87ECCBEC141C3348787`, RSA 4096; never the Ed25519
+  test key of `zig build packages -Dtest-key`), and `gpgv` must find `InRelease`, `Release.gpg`
+  and both `repomd.xml.asc` good signatures by it. A new primary key is a reviewed change to that
+  pin, made with Zigbox's. After deploying, the workflow fetches every file from zigbox.org and
+  fails unless each is served with status 200 and the asset's exact bytes (no redirect, rewrite
+  or added encoding). `.github/deploy.sh verify DIR` checks an unpacked asset by hand.
+- **Never step backwards.** No run moves zigbox.org's packages to an older release, or to none,
+  than the tag the live `/deploy-stamp.txt` names. Only that tag's own asset (refreshed) or a
+  release created after it may replace it. While that tag's asset is not in state `uploaded` (the
+  weekly refresh's `gh release upload --clobber` deletes it before uploading the new one, and an
+  upload in progress is not `uploaded` either), a run deploys nothing and says so in one line,
+  successfully; the next run takes the new asset. A stamp that cannot be read (any status but
+  200 or 404) is treated the same way. If the live tag's release is deleted or made a draft or
+  prerelease with no newer release carrying the asset, runs deploy nothing and warn; the owner
+  steps back with `gh workflow run deploy.yml -R ZigboxOrg/website -f allow_older_packages=true`.
+  The rule is `.github/pick-release.jq`, table-tested by `.github/pick-release-test.sh` in every
+  run. Any other asset state counts as not there, on both sides of the tag.
 - Never add a path under `/zigbox/` or `/zigcube/`: those belong to the project sites, which
   are edited in their own repositories.
 - A URL ending in `.html` redirects (307) to the same URL without it (the assets'
   `auto-trailing-slash` handling); links may use either.
 - Pages here are plain HTML and CSS, light and dark, readable at phone width.
 - The newest release is the one with the latest `created_at` among the releases of
-  `ZigboxOrg/zigbox` that are not drafts, not prereleases and carry a fully uploaded
-  `zigbox-repos.tar.gz`. The workflow sorts by `created_at` itself rather than trusting the API's
-  order; Zigbox's release wait assumes the same rule, and `gh release list` orders the same way.
+  `ZigboxOrg/zigbox` that are not drafts, not prereleases and carry `zigbox-repos.tar.gz` in state
+  `uploaded`, subject to the rule above. The workflow sorts by `created_at` itself rather than
+  trusting the API's order, as does `gh release list`. Zigbox's release wait
+  (`.github/actions/site-serves/wait.sh`) sorts the same way but counts the asset in any state.
 - `/deploy-stamp.txt` names what a deploy was built from, one line each: `site <commit>`,
-  `zigbox <commit>`, `zigcube <commit>` (the `main` commits) and `packages <tag> sha256:<hex>`
-  (the asset's sha256, from the API's `digest`) or `packages none`. The deploy builds from exactly
-  those commits and that asset, and its post-deploy check fetches the stamp as well.
-- The workflow deploys on a push to `main`, on `workflow_dispatch` and on a `repository_dispatch`
-  of type `site`, always. It also runs every 15 minutes (`7,22,37,52 * * * *`), because nothing
-  in Zigbox calls it: a release or the weekly package refresh uploads a new asset and waits for
-  zigbox.org to serve it. A scheduled run computes the stamp with a few API calls, fetches
-  `https://zigbox.org/deploy-stamp.txt`, and stops (successfully) when the two match.
+  `zigbox <commit>`, `zigcube <commit>` (the `main` commits), `packages <tag> sha256:<hex>`
+  (the asset's sha256, from the API's `digest`) or `packages none`, and with packages one
+  `file <sha256> <path>` line for each of the nine signed files apt and dnf fetch (apt
+  `Release`, `InRelease`, `Release.gpg`, both `repomd.xml` and their `.asc`, both keyrings). The
+  deploy builds from exactly those commits and that asset, and its post-deploy check fetches the
+  stamp as well.
+- Only `main` deploys. A push to `main`, a `workflow_dispatch` on `main` and a
+  `repository_dispatch` of type `site` deploy (unless the rule above holds them back); a pull
+  request or a dispatch on another branch only assembles the site and dry-runs the Worker config.
+  The workflow also runs every 15 minutes (`7,22,37,52 * * * *`), because nothing in Zigbox calls
+  it: a release or the weekly package refresh uploads a new asset and waits for zigbox.org to
+  serve it. A scheduled run computes the stamp with a few API calls, fetches
+  `https://zigbox.org/deploy-stamp.txt` and the nine signed files (small; no asset download), and
+  stops (successfully) only when the stamp matches and each file's sha256 is the live stamp's.
+  So a deploy whose post-deploy check failed is retried by the next scheduled run.
+- Until the Cloudflare secrets are set, a scheduled run ends with one warning line and success; a
+  push or dispatch on `main` fails at "Deploy". Any other red scheduled run (an asset that fails a
+  check) repeats every 15 minutes and blocks every update of zigbox.org, the Zigbox and Zigcube
+  sites included, until it is fixed.
+- GitHub disables the scheduled workflows of a public repository after 60 days without activity,
+  and Zigbox's release and refresh then wait in vain. The `keepalive` job re-enables `deploy.yml`
+  on the 1st of each month (`41 3 1 * *`, `actions: write` in that job only). If it was disabled
+  anyway (the Actions tab says so): `gh workflow enable deploy.yml -R ZigboxOrg/website`, then
+  `gh workflow run deploy.yml -R ZigboxOrg/website`, and check the run is green.
+- Actions in the job that holds `CLOUDFLARE_API_TOKEN` are pinned by full commit SHA (the tag in
+  a comment), and wrangler by exact version.
 - Commits follow the Zigbox repository's rules: squash merges, no model names in messages.

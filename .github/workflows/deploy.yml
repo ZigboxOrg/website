@@ -22,16 +22,29 @@ name: Deploy zigbox.org
 # Nothing in Zigbox calls this workflow: its release and its weekly package refresh upload a new
 # zigbox-repos.tar.gz and then wait for zigbox.org to serve it. So the schedule runs every 15
 # minutes, and a scheduled run deploys only when the stamp it computes differs from the one
-# zigbox.org serves. A push, workflow_dispatch or repository_dispatch always deploys.
+# zigbox.org serves, or zigbox.org's signed package files differ from the live stamp's hashes.
+# A push to main, workflow_dispatch or repository_dispatch always deploys; only main deploys.
+# No run moves the packages to an older release, or to none, than the live stamp's tag (AGENTS.md).
+# The logic is .github/deploy.sh and .github/pick-release.jq.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      allow_older_packages:
+        description: >-
+          Deploy the newest release with packages even when it is older than the tag zigbox.org
+          serves (only when that tag's release was deleted or unpublished)
+        type: boolean
+        default: false
   repository_dispatch:
     types: [site]
   schedule:
     - cron: "7,22,37,52 * * * *"
+    # Monthly: the keepalive below. GitHub disables a public repository's schedules after 60
+    # days without activity.
+    - cron: "41 3 1 * *"
 permissions:
   contents: read
 concurrency:
@@ -41,146 +54,56 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      # Only main deploys; any other ref assembles the site and dry-runs the Worker config.
+      PRODUCTION: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: self
+          persist-credentials: false
       # The stamp names everything the site is built from: this repository's commit, the main
-      # commits of ZigboxOrg/zigbox and ZigboxOrg/zigcube, and the packages release's tag and
-      # the sha256 of its zigbox-repos.tar.gz. Later steps build from exactly these commits and
-      # this release, so the stamp describes what is deployed.
+      # commits of ZigboxOrg/zigbox and ZigboxOrg/zigcube, the packages release's tag and the
+      # sha256 of its zigbox-repos.tar.gz, and (added by the next step) the sha256 of each
+      # signed package file. Later steps build from exactly these commits and this asset.
       - name: Compute the deploy stamp
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
-          ASSET: zigbox-repos.tar.gz
           EVENT: ${{ github.event_name }}
           SELF_SHA: ${{ github.sha }}
+          HAVE_CF: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
+          ALLOW_OLDER: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_older_packages }}
         run: |
-          set -eu
-          box=$(gh api repos/ZigboxOrg/zigbox/commits/main --jq .sha)
-          cube=$(gh api repos/ZigboxOrg/zigcube/commits/main --jq .sha)
-          # The newest release is the one with the latest created_at among those that are not
-          # drafts, not prereleases and carry a fully uploaded $ASSET. Zigbox's release wait
-          # assumes the same rule (it is also the order of `gh release list`), so the sort is
-          # written out here rather than taken from the API's order.
-          gh api --paginate --slurp 'repos/ZigboxOrg/zigbox/releases?per_page=100' > releases.json
-          pick=$(jq -r --arg a "$ASSET" '[.[][] | select(.draft == false and .prerelease == false)
-            | . as $r | .assets[] | select(.name == $a and .state == "uploaded")
-            | {tag: $r.tag_name, created: $r.created_at, id, digest: (.digest // "")}]
-            | sort_by(.created) | last | select(. != null) | "\(.tag) \(.id) \(.digest)"' releases.json)
-          tag=""
-          id=""
-          sum=""
-          if [ -n "$pick" ]; then
-            tag=${pick%% *}
-            rest=${pick#* }
-            id=${rest%% *}
-            sum=${rest#* }
-            sum=${sum#sha256:}
-            if [ -z "$sum" ]; then
-              # An asset without the API's digest: hash it here (a few MB).
-              sum=$(gh api -H 'Accept: application/octet-stream' \
-                "repos/ZigboxOrg/zigbox/releases/assets/$id" | sha256sum | cut -d' ' -f1)
-            fi
-          fi
-          {
-            echo "site $SELF_SHA"
-            echo "zigbox $box"
-            echo "zigcube $cube"
-            if [ -n "$tag" ]; then echo "packages $tag sha256:$sum"; else echo "packages none"; fi
-          } > stamp.txt
-          cat stamp.txt
-          {
-            echo "box=$box"
-            echo "cube=$cube"
-            echo "tag=$tag"
-            echo "asset_id=$id"
-            echo "sum=$sum"
-          } >> "$GITHUB_OUTPUT"
-          deploy=true
-          if [ "$EVENT" = schedule ]; then
-            code=$(curl -sS --retry 3 --retry-all-errors -o live-stamp.txt -w '%{http_code}' \
-              "https://zigbox.org/deploy-stamp.txt?run=$GITHUB_RUN_ID" || echo 000)
-            if [ "$code" = 200 ] && cmp -s stamp.txt live-stamp.txt; then
-              echo "unchanged: zigbox.org already serves this stamp, so this run deploys nothing"
-              deploy=false
-            else
-              echo "changed: zigbox.org's stamp (status $code) differs, so this run deploys"
-            fi
-          else
-            echo "deploy: a $EVENT run always builds, whatever zigbox.org serves"
-          fi
-          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+          self/.github/pick-release-test.sh
+          self/.github/deploy.sh gate
+      - name: Fetch and check the signed package repositories
+        id: pkg
         if: steps.gate.outputs.deploy == 'true'
-        with:
-          path: self
-      - uses: actions/checkout@v4
-        if: steps.gate.outputs.deploy == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.gate.outputs.tag }}
+          ASSET_ID: ${{ steps.gate.outputs.asset_id }}
+          SUM: ${{ steps.gate.outputs.sum }}
+        run: self/.github/deploy.sh packages
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.pkg.outputs.go == 'true'
         with:
           repository: ZigboxOrg/zigbox
           ref: ${{ steps.gate.outputs.box }}
           path: box
           sparse-checkout: site
-      - uses: actions/checkout@v4
-        if: steps.gate.outputs.deploy == 'true'
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.pkg.outputs.go == 'true'
         with:
           repository: ZigboxOrg/zigcube
           ref: ${{ steps.gate.outputs.cube }}
           path: cube
           sparse-checkout: site
-      - name: Fetch the signed package repositories
-        if: steps.gate.outputs.deploy == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ASSET: zigbox-repos.tar.gz
-          TAG: ${{ steps.gate.outputs.tag }}
-          ASSET_ID: ${{ steps.gate.outputs.asset_id }}
-          SUM: ${{ steps.gate.outputs.sum }}
-        run: |
-          set -eu
-          mkdir -p pkg
-          if [ -z "$TAG" ]; then
-            echo "packages: no ZigboxOrg/zigbox release carries $ASSET yet, so /apt and /rpm are not deployed"
-            exit 0
-          fi
-          tag=$TAG
-          # The exact asset the stamp names (by id), through the REST API.
-          gh api -H 'Accept: application/octet-stream' \
-            "repos/ZigboxOrg/zigbox/releases/assets/$ASSET_ID" > "pkg/$ASSET"
-          got=$(sha256sum "pkg/$ASSET" | cut -d' ' -f1)
-          if [ "$got" != "$SUM" ]; then
-            echo "packages: $ASSET of $tag changed during this run (sha256 $got, stamp $SUM); the next run deploys it"
-            exit 1
-          fi
-          # Only regular files and directories under apt/ and rpm/, and the two keyring files.
-          # No dot files (the assembly deletes them), no .html (the Worker's auto-trailing-slash
-          # would redirect it), never the test key or the to-sign list.
-          tar -tvzf "pkg/$ASSET" | awk '{ print substr($1, 1, 1) }' | sort -u > pkg/kinds
-          if grep -qvx -e - -e d pkg/kinds; then
-            echo "packages: $ASSET from $tag holds something other than files and directories"
-            exit 1
-          fi
-          tar -tzf "pkg/$ASSET" | sed 's|^\./||' | grep -v '^$' > pkg/list
-          ok='^(apt/|rpm/|zigbox-archive-keyring\.(gpg|asc)$)'
-          if grep -vE "$ok" pkg/list || grep -E '(^|/)\.|\.html?$|to-sign|zigbox-test-key' pkg/list
-          then
-            echo "packages: $ASSET from $tag holds the paths above, which zigbox.org must not serve"
-            exit 1
-          fi
-          mkdir pkg/tree
-          tar -xzf "pkg/$ASSET" -C pkg/tree --no-same-owner --no-same-permissions
-          for f in apt/dists/stable/Release apt/dists/stable/InRelease apt/dists/stable/Release.gpg \
-            rpm/x86_64/repodata/repomd.xml rpm/x86_64/repodata/repomd.xml.asc \
-            rpm/aarch64/repodata/repomd.xml rpm/aarch64/repodata/repomd.xml.asc \
-            zigbox-archive-keyring.gpg zigbox-archive-keyring.asc; do
-            test -s "pkg/tree/$f" || { echo "packages: $f is missing from $ASSET of $tag"; exit 1; }
-          done
-          # Workers static assets refuse a file over 25 MiB.
-          big=$(find pkg/tree -type f -size +25M)
-          if [ -n "$big" ]; then echo "packages: over 25 MiB, which the Worker cannot serve: $big"; exit 1; fi
-          (cd pkg/tree && find . -type f | sed 's|^\./||' | sort | xargs sha256sum) > pkg/manifest
-          echo "packages: $(wc -l < pkg/manifest) files from $ASSET of Zigbox $tag"
+          persist-credentials: false
       - name: Assemble the site
-        if: steps.gate.outputs.deploy == 'true'
+        if: steps.pkg.outputs.go == 'true'
         run: |
           set -eu
           out=self/_site
@@ -205,16 +128,16 @@ jobs:
             zigbox/index.html zigcube/index.html zigcube/architecture.html; do
             test -s "$out/$f" || { echo "not deployed: $f is missing from the assembled site"; exit 1; }
           done
-      - uses: actions/setup-node@v4
-        if: steps.gate.outputs.deploy == 'true'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.pkg.outputs.go == 'true'
         with:
           node-version: 22
       - name: Check the Worker config
-        if: steps.gate.outputs.deploy == 'true'
+        if: steps.pkg.outputs.go == 'true'
         working-directory: self
         run: npx --yes wrangler@4.151.3 deploy --dry-run
       - name: Deploy
-        if: steps.gate.outputs.deploy == 'true' && github.event_name != 'pull_request'
+        if: steps.pkg.outputs.go == 'true' && env.PRODUCTION == 'true'
         working-directory: self
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -226,35 +149,21 @@ jobs:
           fi
           npx --yes wrangler@4.151.3 deploy
       - name: Check zigbox.org serves the package repositories and the stamp unchanged
-        if: steps.gate.outputs.deploy == 'true' && github.event_name != 'pull_request'
+        if: steps.pkg.outputs.go == 'true' && env.PRODUCTION == 'true'
+        run: self/.github/deploy.sh check
+  # Keeps the schedule alive: GitHub disables a public repository's scheduled workflows after 60
+  # days without activity, and Zigbox's release and refresh wait on this schedule. If it was
+  # disabled anyway: `gh workflow enable deploy.yml -R ZigboxOrg/website`, then
+  # `gh workflow run deploy.yml -R ZigboxOrg/website` (AGENTS.md).
+  keepalive:
+    if: github.event_name == 'schedule' && github.event.schedule == '41 3 1 * *'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
-          # The stamp is checked too: the next scheduled run skips the deploy only when it matches.
-          {
-            if [ -f pkg/manifest ]; then cat pkg/manifest; fi
-            echo "$(sha256sum < stamp.txt | cut -d' ' -f1)  deploy-stamp.txt"
-          } > served
-          if [ ! -f pkg/manifest ]; then echo "packages: none deployed, checking the stamp alone"; fi
-          # No redirect followed and no decoding: a 3xx, a rewrite or a Content-Encoding the
-          # asset did not have all show as a status or digest mismatch. The edge may serve the
-          # previous release's Release or InRelease for a short while, so retry before failing.
-          mkdir -p pkg
-          for attempt in 1 2 3 4 5 6; do
-            bad=0
-            while read -r sum path; do
-              code=$(curl -sS --retry 3 --retry-all-errors -o pkg/got -w '%{http_code}' \
-                "https://zigbox.org/$path" || echo 000)
-              got=$(sha256sum pkg/got | cut -d' ' -f1)
-              if [ "$code" != 200 ] || [ "$got" != "$sum" ]; then
-                echo "check $attempt: /$path served $code, sha256 $got; expected $sum"
-                bad=1
-              fi
-            done < served
-            if [ "$bad" = 0 ]; then
-              echo "served: zigbox.org serves all $(wc -l < served) checked files unchanged"
-              exit 0
-            fi
-            sleep 20
-          done
-          echo "not served: zigbox.org does not serve the repositories and the stamp as deployed"
-          exit 1
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/enable"
+          echo "keepalive: deploy.yml enabled"
