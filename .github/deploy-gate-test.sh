@@ -13,6 +13,10 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
+# The scenario knobs (cf, older, at) are this script's own: never taken from the caller, whose
+# environment may be a workflow step's (HAVE_CF=false on a pull request, for one).
+unset cf older at
+mkdir -p "$work/home"
 signed=(apt/dists/stable/Release apt/dists/stable/Release.gpg apt/dists/stable/InRelease
   rpm/x86_64/repodata/repomd.xml rpm/x86_64/repodata/repomd.xml.asc
   rpm/aarch64/repodata/repomd.xml rpm/aarch64/repodata/repomd.xml.asc
@@ -71,15 +75,22 @@ serve() {
 }
 
 fails=0
-# scenario NAME EVENT DEPLOY LOG [PACKAGES]: runs the gate (environment from HAVE_CF, ALLOW_OLDER
-# and SITE as set); checks deploy=DEPLOY, a log line matching LOG (grep -E) and, when given, the
-# stamp's packages line.
+# run_gate DIR EVENT: runs the gate in DIR with exactly this environment and no other (env -i), so
+# nothing the caller set reaches it: not a workflow step's HAVE_CF, EVENT or GITHUB_* variables,
+# not GH_TOKEN (no scenario may call the API), not a proxy for the local server, not ~/.curlrc.
+# The knobs: cf (HAVE_CF, default true), older (ALLOW_OLDER, default false), at (SITE).
+run_gate() {
+  (cd "$1" && env -i PATH="$PATH" HOME="$work/home" LC_ALL=C EVENT="$2" SELF_SHA=s \
+    HAVE_CF="${cf:-true}" ALLOW_OLDER="${older:-false}" SITE="${at:-$site}" \
+    GITHUB_OUTPUT="$1/out" GITHUB_RUN_ID=1 GATE_BOX=b GATE_CUBE=c \
+    GATE_RELEASES="$work/releases.json" "$gate" gate > "$1/log" 2>&1)
+}
+# scenario NAME EVENT DEPLOY LOG [PACKAGES]: runs the gate (run_gate); checks deploy=DEPLOY, a log
+# line matching LOG (grep -E) and, when given, the stamp's packages line.
 scenario() {
   local name=$1 event=$2 want=$3 log=$4 pkgs=${5:-} dir got rc=0
   dir=$(mktemp -d "$work/run.XXXX")
-  (cd "$dir" && EVENT=$event SELF_SHA=s HAVE_CF=${HAVE_CF:-true} ALLOW_OLDER=${ALLOW_OLDER:-false} \
-    SITE=${SITE:-$site} GITHUB_OUTPUT=$dir/out GATE_BOX=b GATE_CUBE=c \
-    GATE_RELEASES=$work/releases.json "$gate" gate > "$dir/log" 2>&1) || rc=$?
+  run_gate "$dir" "$event" || rc=$?
   got=$(sed -n 's/^deploy=//p' "$dir/out" 2> /dev/null | tail -n 1)
   if [ "$rc" != 0 ] || [ "$got" != "$want" ]; then
     echo "deploy-gate: $name: exit $rc, deploy='$got', want '$want'"; sed 's/^/  | /' "$dir/log"
@@ -151,9 +162,9 @@ scenario "refresh gap, a newer release: takes it" schedule true '^changed' "v0.7
 
 # The Cloudflare secrets.
 releases "$old" "$cur"
-HAVE_CF=false scenario "secrets unset on a schedule: warns" schedule false \
+cf=false scenario "secrets unset on a schedule: warns" schedule false \
   '^::warning::not deployed: the CLOUDFLARE_API_TOKEN'
-HAVE_CF=false scenario "secrets unset on a push: goes on" push true '^deploy: a push run' "$p6"
+cf=false scenario "secrets unset on a push: goes on" push true '^deploy: a push run' "$p6"
 
 # The live release deleted.
 releases "$old"
@@ -161,7 +172,7 @@ scenario "live release gone: warns" schedule false \
   '^::warning::not deployed: zigbox.org serves v0.6.0, which is no longer'
 scenario "live release gone, on a push: warns" push false \
   '^::warning::not deployed: zigbox.org serves v0.6.0'
-ALLOW_OLDER=true scenario "live release gone, allow_older_packages" workflow_dispatch true \
+older=true scenario "live release gone, allow_older_packages" workflow_dispatch true \
   '^packages: v0.6.0 is no longer a published release' "v0.5.0 $c5 sha256:5"
 releases "$old" "$next"
 scenario "live release gone, a newer one: takes it" schedule true '^changed' "v0.7.0 $c7 sha256:7"
@@ -170,10 +181,10 @@ scenario "live release gone, a stamp with no date: warns" schedule false \
   '^::warning::not deployed: zigbox.org serves v0.6.0, which is no longer'
 serve "$p6"
 releases "$old" "$cur" "$(rel v0.7.0 $c7 "$(ago '10 minutes')")"
-ALLOW_OLDER=true scenario "allow_older_packages, the live release still published" \
+older=true scenario "allow_older_packages, the live release still published" \
   workflow_dispatch true '^deploy: a workflow_dispatch run' "$p6"
 releases
-ALLOW_OLDER=true scenario "allow_older_packages with no release: never none" \
+older=true scenario "allow_older_packages with no release: never none" \
   workflow_dispatch false \
   '^::warning::not deployed: no published release exists'
 
@@ -188,17 +199,16 @@ releases "$old" "$cur_gap"
 scenario "an unreadable stamp in a gap, on a push: never the older one" push false \
   '^::warning::not deployed: .* v0.6.0 is not uploaded'
 releases "$old" "$cur"
-SITE=$down scenario "zigbox.org down, on a schedule: warns" schedule false \
+at=$down scenario "zigbox.org down, on a schedule: warns" schedule false \
   '^::warning::not deployed: .*answered 000'
-SITE=$down scenario "zigbox.org down, on a dispatch: deploys" workflow_dispatch true \
+at=$down scenario "zigbox.org down, on a dispatch: deploys" workflow_dispatch true \
   '^::warning::.*answered 000; a workflow_dispatch run deploys' "$p6"
 
 # A scenario that skips without a warning must not print one.
 releases "$old" "$cur_gap"
 serve "$p6"
 dir=$(mktemp -d "$work/run.XXXX")
-(cd "$dir" && EVENT=schedule SELF_SHA=s HAVE_CF=true SITE=$site GITHUB_OUTPUT=$dir/out GATE_BOX=b \
-  GATE_CUBE=c GATE_RELEASES=$work/releases.json "$gate" gate > "$dir/log" 2>&1)
+run_gate "$dir" schedule
 if grep -q '::warning::' "$dir/log" || ! grep -qE "$nowarn" "$dir/log"; then
   echo "deploy-gate: a short refresh gap on a schedule warns"; fails=1
 fi
